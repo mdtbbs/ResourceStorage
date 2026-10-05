@@ -1,0 +1,23 @@
+[Unit]
+Description=MDTBBS ResourceStorage
+After=network.target
+
+[Service]
+Type=simple
+User=resource-storage
+Group=resource-storage
+WorkingDirectory=/opt/resource-storage
+EnvironmentFile=/etc/resource-storage/resource-storage.env
+ExecStart=/usr/bin/node /opt/resource-storage/dist/server.js
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/resource-storage
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
