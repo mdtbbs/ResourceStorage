@@ -1,6 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createReadStream, unlinkSync, writeFileSync } from 'node:fs';
-import { unlink } from 'node:fs/promises';
 import path from 'node:path';
 import express, { type ErrorRequestHandler, type Express, type Request, type Response } from 'express';
 import helmet from 'helmet';
@@ -134,7 +133,7 @@ async function streamObject(
   res.setHeader('Content-Type', mediaType(object.mime_type));
   res.setHeader('Content-Disposition', contentDisposition(filename));
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Cache-Control', isPublic ? 'public, max-age=31536000, immutable' : 'private, no-store');
+  res.setHeader('Cache-Control', isPublic ? 'public, max-age=86400' : 'private, no-store');
   if (!isPublic) res.setHeader('Pragma', 'no-cache');
 
   if (isEtagMatch(req.header('if-none-match'), etag)) {
@@ -248,16 +247,21 @@ function installAccessLogging(app: Express, db: SqliteDatabase, config: AppConfi
   });
 }
 
-async function completeUpload(
+export async function completeUpload(
   db: SqliteDatabase,
   config: AppConfig,
   session: UploadSessionRow,
   tempFilename: string,
   actual: { sizeBytes: number; sha256: string },
+  installFile: typeof installContentAddressedFile = installContentAddressedFile,
 ): Promise<ObjectRow> {
   let installed = false;
   let finalPath: string | null = null;
   try {
+    const installedFile = await installFile(config, tempFilename, actual.sha256);
+    installed = installedFile.installed;
+    finalPath = resolveStoragePath(config.dataRoot, installedFile.key);
+
     db.exec('BEGIN IMMEDIATE');
     const currentSession = db.prepare('SELECT state FROM upload_sessions WHERE id = ?').get(session.id) as { state: string } | undefined;
     if (!currentSession || currentSession.state !== 'uploading') throw new HttpError(409, 'upload_replayed', 'The upload session has already been used');
@@ -270,9 +274,6 @@ async function completeUpload(
       }
       object = existing;
     } else {
-      const installedFile = await installContentAddressedFile(config, tempFilename, actual.sha256);
-      installed = installedFile.installed;
-      finalPath = resolveStoragePath(config.dataRoot, installedFile.key);
       const now = nowIso();
       object = {
         id: randomUUID(),
@@ -299,12 +300,36 @@ async function completeUpload(
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* No transaction remained open. */ }
     if (installed && finalPath) {
-      const stored = db.prepare('SELECT 1 FROM objects WHERE sha256 = ?').get(actual.sha256);
-      if (!stored) await unlink(finalPath).catch(() => undefined);
+      cleanupFailedCasInstall(db, session.id, actual.sha256, finalPath);
     }
     throw error;
   } finally {
     await removeTempFile(tempFilename);
+  }
+}
+
+function cleanupFailedCasInstall(db: SqliteDatabase, sessionId: string, sha256: string, filename: string): void {
+  try {
+    // Serialize the absence check with object creation; unlink only in this rare failure path.
+    db.exec('BEGIN IMMEDIATE');
+    db.prepare("UPDATE upload_sessions SET state = 'failed' WHERE id = ? AND state = 'uploading'").run(sessionId);
+    const referenced = db.prepare('SELECT 1 FROM objects WHERE sha256 = ?').get(sha256);
+    const anotherUpload = db.prepare(`
+      SELECT 1 FROM upload_sessions
+      WHERE id <> ? AND state = 'uploading'
+        AND (expected_sha256 IS NULL OR expected_sha256 = ?)
+      LIMIT 1
+    `).get(sessionId, sha256);
+    if (!referenced && !anotherUpload) {
+      try {
+        unlinkSync(filename);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    db.exec('COMMIT');
+  } catch {
+    try { db.exec('ROLLBACK'); } catch { /* Keep the CAS file if cleanup could not be verified. */ }
   }
 }
 

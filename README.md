@@ -58,7 +58,7 @@ Copy `.env.example` and set a unique key with at least 32 random bytes. Keep the
 | `RES_SERVICE_API_KEY` | required | Server-to-server bearer credential; minimum 32 bytes |
 | `RES_ADMIN_API_KEY` | unset | Optional separate key for GC and integrity endpoints; the service key also works |
 | `PUBLIC_BASE_URL` | `https://res.mdtbbs.cn` | Public URL placed in upload-session and private-link responses |
-| `MAX_OBJECT_SIZE` | `1073741824` | Maximum upload size in bytes (1 GiB) |
+| `MAX_OBJECT_SIZE` | `268435456` | Maximum upload size in bytes (256 MiB) |
 | `UPLOAD_SESSION_TTL_SECONDS` | `900` | Upload token validity; defaults to 15 minutes |
 | `PRIVATE_DOWNLOAD_TTL_SECONDS` | `300` | Default signed-download lifetime |
 | `GC_GRACE_DAYS` | `7` | Minimum unbound object age before GC |
@@ -84,7 +84,7 @@ All JSON errors use `{ "error": { "code": "...", "message": "..." }, "request_id
 | `DELETE /api/v1/objects/:id/bindings/:bindingId` | Service API Key | Remove a binding; does not delete bytes |
 | `POST /api/v1/objects/:id/signed-url` | Service API Key | Issue a short-lived private download URL |
 | `GET /private/:token` | Short-lived URL token | Private, no-store download with Range support |
-| `GET` or `HEAD /o/:publicId/:filename` | Public binding | Public immutable download with Range, ETag, and UTF-8 filename support |
+| `GET` or `HEAD /o/:publicId/:filename` | Public binding | Public download cached for 24 hours, with Range, ETag, and UTF-8 filename support |
 | `POST /api/admin/gc` | Service or admin key | Run GC; `{ "dry_run": true }` reports candidates without deleting |
 | `POST /api/admin/integrity/scan` | Service or admin key | Check all non-quarantined objects and mark missing/corrupt rows |
 
@@ -138,9 +138,9 @@ For a private download, `POST /api/v1/objects/<object-id>/signed-url` with the s
 
 ### Range and caching
 
-The public endpoint returns `ETag: "<sha256>"`, `Accept-Ranges: bytes`, `Content-Length`, `Content-Disposition`, and `Cache-Control: public, max-age=31536000, immutable`. It supports single byte ranges, conditional `If-None-Match` requests, and `HEAD`. Service content and private links also support a single byte range but are never publicly cacheable.
+The public endpoint returns `ETag: "<sha256>"`, `Accept-Ranges: bytes`, `Content-Length`, `Content-Disposition`, and `Cache-Control: public, max-age=86400`. It supports single byte ranges, conditional `If-None-Match` requests, and `HEAD`. Service content and private links also support a single byte range but are never publicly cacheable; API and private responses use `Cache-Control: private, no-store`.
 
-Public binding is a publication decision. Removing a binding blocks future origin requests, but cannot recall a response already cached by EdgeOne or a browser. Only bind files intended for public distribution. For updated content, upload a new object; it receives a different content hash and public ID. EdgeOne cache purge can remove edge copies, but it cannot purge copies already stored by browsers.
+Public binding is a publication decision. Removing a binding blocks future origin requests, but cannot recall a response already cached by EdgeOne or a browser. Only bind files intended for public distribution. Public responses are cached for 24 hours by default; administrators can manually purge EdgeOne in an urgent takedown. For updated content, upload a new object; it receives a different content hash and public ID. A purge cannot remove copies already stored by browsers.
 
 ## SQLite and object layout
 
@@ -165,7 +165,7 @@ DATA_ROOT/
 └── temp/
 ```
 
-Installation uses a same-filesystem atomic hard link into the hash path and an SQLite write transaction so simultaneous uploads of identical bytes create one object row. Object deletion is a separate GC operation. GC requires no bindings, age beyond the grace period, no relevant active upload session, and no unexpired private link. Quarantined objects are retained for manual review.
+Installation verifies or creates a same-filesystem atomic hard link into the hash path before the SQLite write transaction. The short transaction re-checks upload session state and the hash row before inserting, so simultaneous uploads of identical bytes create one object row. On transaction failure, a failed newly installed file is removed only after a locked check confirms that no object row or in-flight upload can use it. Object deletion is a separate GC operation. GC requires no bindings, age beyond the grace period, no relevant active upload session, and no unexpired private link. Quarantined objects are retained for manual review.
 
 ## Logging and download counts
 
@@ -178,7 +178,7 @@ Logs never store cookies, Authorization headers, upload/private tokens, request 
 Add `res.mdtbbs.cn` to EdgeOne and point the origin at the ResourceStorage reverse proxy. Configure rules in this order:
 
 1. `/api/*`, `/upload/*`, and `/private/*`: **do not cache**, regardless of origin response headers.
-2. `/o/*`: follow the origin `Cache-Control` header so the service's public immutable response can be cached. Do not force a generic cache header over private/API routes.
+2. `/o/*`: follow the origin `Cache-Control` header (`public, max-age=86400`) so public resources can be cached for 24 hours. Do not force a generic cache header over private/API routes.
 3. Keep the filename segment in the public URL/cache key because it controls `Content-Disposition`.
 4. The service varies browser CORS responses by `Origin`; enable EdgeOne's `Vary: Origin` handling for `/o/*`, and do not add a second, conflicting CORS response-header rule at EdgeOne.
 5. Enable Range origin pulls if desired and verify `206`, `Content-Range`, and the returned bytes through the public EdgeOne hostname.

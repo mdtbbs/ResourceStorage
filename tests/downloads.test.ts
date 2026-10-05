@@ -32,7 +32,8 @@ test('serves public objects only after public binding, with ETag, Range, HEAD, a
   assert.equal(await response.text(), 'abcdefghij');
   const etag = response.headers.get('etag');
   assert.equal(etag, `"${object.sha256}"`);
-  assert.match(response.headers.get('cache-control') ?? '', /public, max-age=31536000, immutable/);
+  assert.equal(response.headers.get('cache-control'), 'public, max-age=86400');
+  assert.equal(response.headers.get('cache-control')?.includes('immutable'), false);
   assert.match(response.headers.get('content-disposition') ?? '', /filename\*=UTF-8''/);
   assert.match(decodeURIComponent(response.headers.get('content-disposition') ?? ''), /建筑图纸\.msch/);
 
@@ -64,6 +65,7 @@ test('service metadata and content endpoints require the service API key and str
   assert.equal(denied.status, 401);
   const metadata = await fetch(`${fixture.baseUrl}/api/v1/objects/${object.id}`, { headers: { authorization: 'Bearer ' + 's'.repeat(64) } });
   assert.equal(metadata.status, 200);
+  assert.equal(metadata.headers.get('cache-control'), 'private, no-store');
   const content = await fetch(`${fixture.baseUrl}/api/v1/objects/${object.id}/content`, {
     headers: { authorization: 'Bearer ' + 's'.repeat(64), range: 'bytes=-4' },
   });

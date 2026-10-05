@@ -20,5 +20,5 @@ Before changing code, inspect this file and `README.md`. Keep forum resource met
 - Do not use client-supplied proxy headers unless `TRUST_EDGEONE=true`; only trust EdgeOne headers when origin access is restricted to trusted EdgeOne traffic.
 - Do not delete stored objects as part of binding deletion. Physical deletion belongs to grace-period GC.
 - Do not change `file.mdtbbs.cn` or the existing `download-site` service from this repository.
-- Public URLs use long-lived immutable cache headers. Treat public binding as a publication decision; revocation does not recall copies already cached by EdgeOne or browsers.
+- Public URLs use a 24-hour cache lifetime. Treat public binding as a publication decision; revocation does not recall copies already cached by EdgeOne or browsers. Administrators can manually purge EdgeOne for urgent takedowns.
 - Keep migrations additive and versioned under `migrations/`.

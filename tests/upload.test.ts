@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readdir } from 'node:fs/promises';
+import { readdir, stat, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import test from 'node:test';
+import { completeUpload } from '../src/app';
+import { installContentAddressedFile, resolveStoragePath, tempPath } from '../src/file-store';
 import { createFixture, createUpload, putUpload, SERVICE_KEY, uploadObject } from './helpers';
 
 test('streams a regular upload, records SHA-256, and rejects replay', async (t) => {
@@ -81,6 +84,58 @@ test('deduplicates known hashes and concurrent CAS uploads', async (t) => {
   const dataB = await b.json() as { object: { id: string } };
   assert.equal(dataA.object.id, dataB.object.id);
   assert.equal((fixture.db.prepare('SELECT COUNT(*) AS count FROM objects').get() as { count: number }).count, 1);
+});
+
+test('transaction failure preserves a CAS file another concurrent upload bound', async (t) => {
+  const fixture = await createFixture();
+  t.after(() => fixture.close());
+  const bytes = Buffer.from('shared CAS survives one transaction failure');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const first = await createUpload(fixture, bytes);
+  const second = await createUpload(fixture, bytes);
+  assert.ok(first.data.upload && second.data.upload);
+
+  const firstSession = fixture.db.prepare('SELECT * FROM upload_sessions WHERE public_id = ?').get(first.data.upload.session_id) as Parameters<typeof completeUpload>[2];
+  const secondSession = fixture.db.prepare('SELECT * FROM upload_sessions WHERE public_id = ?').get(second.data.upload.session_id) as Parameters<typeof completeUpload>[2];
+  fixture.db.prepare("UPDATE upload_sessions SET state = 'uploading' WHERE id IN (?, ?)").run(firstSession.id, secondSession.id);
+  fixture.db.exec(`
+    CREATE TRIGGER fail_first_upload_completion
+    BEFORE UPDATE OF state ON upload_sessions
+    WHEN OLD.id = '${firstSession.id}' AND NEW.state = 'completed'
+    BEGIN
+      SELECT RAISE(ABORT, 'simulated transaction failure');
+    END
+  `);
+
+  const firstTemp = tempPath(fixture.config, firstSession.public_id);
+  const secondTemp = tempPath(fixture.config, secondSession.public_id);
+  await Promise.all([writeFile(firstTemp, bytes, { flag: 'wx', mode: 0o600 }), writeFile(secondTemp, bytes, { flag: 'wx', mode: 0o600 })]);
+  let notifyInstalled!: () => void;
+  let continueFirst!: () => void;
+  const installed = new Promise<void>((resolve) => { notifyInstalled = resolve; });
+  const firstGate = new Promise<void>((resolve) => { continueFirst = resolve; });
+  const gatedInstaller: typeof installContentAddressedFile = async (config, filename, digest) => {
+    const result = await installContentAddressedFile(config, filename, digest);
+    notifyInstalled();
+    await firstGate;
+    return result;
+  };
+
+  const failedCompletion = completeUpload(fixture.db, fixture.config, firstSession, firstTemp, { sizeBytes: bytes.length, sha256 }, gatedInstaller);
+  await installed;
+  let successfulObject: Awaited<ReturnType<typeof completeUpload>>;
+  try {
+    successfulObject = await completeUpload(fixture.db, fixture.config, secondSession, secondTemp, { sizeBytes: bytes.length, sha256 });
+  } finally {
+    continueFirst();
+  }
+  await assert.rejects(failedCompletion, /simulated transaction failure/);
+
+  assert.equal((fixture.db.prepare('SELECT COUNT(*) AS count FROM objects WHERE sha256 = ?').get(sha256) as { count: number }).count, 1);
+  assert.equal((fixture.db.prepare('SELECT state FROM upload_sessions WHERE id = ?').get(firstSession.id) as { state: string }).state, 'failed');
+  assert.ok(successfulObject);
+  assert.equal((await stat(resolveStoragePath(fixture.config.dataRoot, successfulObject.storage_key))).size, bytes.length);
+  assert.deepEqual(await readdir(path.join(fixture.config.dataRoot, 'temp')), []);
 });
 
 test('requires API credentials for upload session creation', async (t) => {

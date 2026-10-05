@@ -98,7 +98,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     serviceApiKey,
     adminApiKey,
     publicBaseUrl,
-    maxObjectSize: integer(env, 'MAX_OBJECT_SIZE', 1_073_741_824, 1, Number.MAX_SAFE_INTEGER),
+    maxObjectSize: integer(env, 'MAX_OBJECT_SIZE', 268_435_456, 1, Number.MAX_SAFE_INTEGER),
     uploadSessionTtlSeconds: integer(env, 'UPLOAD_SESSION_TTL_SECONDS', 900, 30, 86_400),
     privateDownloadTtlSeconds: integer(env, 'PRIVATE_DOWNLOAD_TTL_SECONDS', 300, 30, 86_400),
     gcGraceDays: integer(env, 'GC_GRACE_DAYS', 7, 0, 36_500),
