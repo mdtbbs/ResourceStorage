@@ -8,6 +8,20 @@ END;
 
 CREATE INDEX objects_unbound_state_idx ON objects(unbound_at, state);
 
+CREATE TRIGGER objects_after_insert_unbound
+AFTER INSERT ON objects
+BEGIN
+  UPDATE objects SET unbound_at = NEW.created_at WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER objects_after_created_at_update_unbound
+AFTER UPDATE OF created_at ON objects
+WHEN (OLD.unbound_at IS NULL OR OLD.unbound_at = OLD.created_at)
+  AND NOT EXISTS (SELECT 1 FROM object_bindings b WHERE b.object_id = NEW.id)
+BEGIN
+  UPDATE objects SET unbound_at = NEW.created_at WHERE id = NEW.id;
+END;
+
 CREATE TRIGGER object_bindings_after_insert_unbound
 AFTER INSERT ON object_bindings
 BEGIN
