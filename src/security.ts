@@ -27,15 +27,18 @@ export function bearerToken(req: Request): string | null {
   return match?.[1] ?? null;
 }
 
-function rejectUnauthorized(res: Response): void {
+function rejectUnauthorized(req: Request, res: Response): void {
   res.setHeader('WWW-Authenticate', 'Bearer realm="resource-storage"');
-  res.status(401).json({ error: { code: 'unauthorized', message: 'A valid bearer token is required' } });
+  res.status(401).json({
+    error: { code: 'unauthorized', message: 'A valid bearer token is required' },
+    request_id: req.requestId,
+  });
 }
 
 export function serviceAuth(config: AppConfig): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const supplied = bearerToken(req);
-    if (!supplied || !safeEqualString(supplied, config.serviceApiKey)) return rejectUnauthorized(res);
+    if (!supplied || !safeEqualString(supplied, config.serviceApiKey)) return rejectUnauthorized(req, res);
     next();
   };
 }
@@ -45,7 +48,7 @@ export function adminAuth(config: AppConfig): RequestHandler {
     const supplied = bearerToken(req);
     const serviceMatches = supplied ? safeEqualString(supplied, config.serviceApiKey) : false;
     const adminMatches = supplied && config.adminApiKey ? safeEqualString(supplied, config.adminApiKey) : false;
-    if (!serviceMatches && !adminMatches) return rejectUnauthorized(res);
+    if (!serviceMatches && !adminMatches) return rejectUnauthorized(req, res);
     next();
   };
 }
