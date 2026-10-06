@@ -22,20 +22,20 @@ function gcCandidates(db: SqliteDatabase, cutoff: string, now: string, objectIds
   return db.prepare(`
     SELECT o.id, o.sha256, o.size_bytes, o.storage_key, o.created_at, o.state
     FROM objects o
-    WHERE o.created_at <= ?
+    WHERE o.unbound_at IS NOT NULL AND o.unbound_at <= ?
       AND (o.id IN (${placeholders}) OR o.public_id IN (${placeholders}))
       AND o.state <> 'quarantined'
       AND NOT EXISTS (SELECT 1 FROM object_bindings b WHERE b.object_id = o.id)
       AND NOT EXISTS (
         SELECT 1 FROM upload_sessions s
-        WHERE s.state IN ('open', 'uploading') AND s.expires_at > ?
-          AND (s.expected_sha256 IS NULL OR s.expected_sha256 = o.sha256)
+        WHERE s.state = 'uploading' AND s.expires_at > ?
+          AND s.expected_sha256 = o.sha256
       )
       AND NOT EXISTS (
         SELECT 1 FROM private_download_tokens t
         WHERE t.object_id = o.id AND t.expires_at > ?
       )
-    ORDER BY o.created_at ASC, o.id ASC
+    ORDER BY o.unbound_at ASC, o.id ASC
     LIMIT ?
   `).all(cutoff, ...objectIds, ...objectIds, now, now, limit) as ObjectRow[];
 }
@@ -104,11 +104,11 @@ export async function runGarbageCollection(db: SqliteDatabase, config: AppConfig
       const current = db.prepare(`
         SELECT o.id, o.sha256, o.size_bytes, o.storage_key, o.created_at, o.state
         FROM objects o
-        WHERE o.id = ? AND o.created_at <= ? AND o.state <> 'quarantined'
+        WHERE o.id = ? AND o.unbound_at IS NOT NULL AND o.unbound_at <= ? AND o.state <> 'quarantined'
           AND NOT EXISTS (SELECT 1 FROM object_bindings b WHERE b.object_id = o.id)
           AND NOT EXISTS (
-            SELECT 1 FROM upload_sessions s WHERE s.state IN ('open', 'uploading')
-              AND s.expires_at > ? AND (s.expected_sha256 IS NULL OR s.expected_sha256 = o.sha256)
+            SELECT 1 FROM upload_sessions s WHERE s.state = 'uploading'
+              AND s.expires_at > ? AND s.expected_sha256 = o.sha256
           )
           AND NOT EXISTS (SELECT 1 FROM private_download_tokens t WHERE t.object_id = o.id AND t.expires_at > ?)
       `).get(candidate.id, cutoff, now, now) as ObjectRow | undefined;
