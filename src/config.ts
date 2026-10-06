@@ -71,7 +71,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('PUBLIC_BASE_URL must contain only the public service origin');
   }
 
-  const originsRaw = env.CORS_ALLOWED_ORIGINS?.trim() || 'https://mdtbbs.cn,http://localhost:3000';
+  const originsRaw = env.CORS_ALLOWED_ORIGINS?.trim()
+    || (nodeEnv === 'production' ? 'https://mdtbbs.cn' : 'https://mdtbbs.cn,http://localhost:3000');
   const corsAllowedOrigins = new Set<string>();
   for (const item of originsRaw.split(',').map((origin) => origin.trim()).filter(Boolean)) {
     if (item === '*') throw new Error('CORS_ALLOWED_ORIGINS cannot contain *');
@@ -100,7 +101,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     publicBaseUrl,
     maxObjectSize: integer(env, 'MAX_OBJECT_SIZE', 268_435_456, 1, Number.MAX_SAFE_INTEGER),
     uploadSessionTtlSeconds: integer(env, 'UPLOAD_SESSION_TTL_SECONDS', 900, 30, 86_400),
-    privateDownloadTtlSeconds: integer(env, 'PRIVATE_DOWNLOAD_TTL_SECONDS', 300, 30, 86_400),
+    privateDownloadTtlSeconds: integer(env, 'PRIVATE_DOWNLOAD_TTL_SECONDS', 300, 30, 3_600),
     gcGraceDays: integer(env, 'GC_GRACE_DAYS', 7, 0, 36_500),
     accessLogRetentionDays: integer(env, 'ACCESS_LOG_RETENTION_DAYS', 210, 1, 36_500),
     corsAllowedOrigins,
