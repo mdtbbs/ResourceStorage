@@ -309,13 +309,32 @@ export async function completeUpload(
   let installed = false;
   let finalPath: string | null = null;
   try {
+    const currentSession = db.prepare('SELECT state, expected_sha256 FROM upload_sessions WHERE id = ?')
+      .get(session.id) as { state: string; expected_sha256: string | null } | undefined;
+    if (!currentSession || currentSession.state !== 'uploading') {
+      throw new HttpError(409, 'upload_replayed', 'The upload session has already been used');
+    }
+    if (currentSession.expected_sha256 && currentSession.expected_sha256 !== actual.sha256) {
+      throw new HttpError(422, 'sha256_mismatch', 'The uploaded content does not match the expected SHA-256 digest');
+    }
+    if (!currentSession.expected_sha256) {
+      const pinned = db.prepare("UPDATE upload_sessions SET expected_sha256 = ? WHERE id = ? AND state = 'uploading' AND expected_sha256 IS NULL")
+        .run(actual.sha256, session.id);
+      if (pinned.changes !== 1) {
+        throw new HttpError(409, 'upload_replayed', 'The upload session has already been used');
+      }
+    }
+
     const installedFile = await installFile(config, tempFilename, actual.sha256);
     installed = installedFile.installed;
     finalPath = resolveStoragePath(config.dataRoot, installedFile.key);
 
     db.exec('BEGIN IMMEDIATE');
-    const currentSession = db.prepare('SELECT state FROM upload_sessions WHERE id = ?').get(session.id) as { state: string } | undefined;
-    if (!currentSession || currentSession.state !== 'uploading') throw new HttpError(409, 'upload_replayed', 'The upload session has already been used');
+    const lockedSession = db.prepare('SELECT state, expected_sha256 FROM upload_sessions WHERE id = ?')
+      .get(session.id) as { state: string; expected_sha256: string | null } | undefined;
+    if (!lockedSession || lockedSession.state !== 'uploading' || lockedSession.expected_sha256 !== actual.sha256) {
+      throw new HttpError(409, 'upload_replayed', 'The upload session has already been used');
+    }
 
     const existing = db.prepare('SELECT * FROM objects WHERE sha256 = ?').get(actual.sha256) as ObjectRow | undefined;
     let object: ObjectRow;
@@ -368,7 +387,7 @@ function cleanupFailedCasInstall(db: SqliteDatabase, sessionId: string, sha256: 
     const anotherUpload = db.prepare(`
       SELECT 1 FROM upload_sessions
       WHERE id <> ? AND state = 'uploading'
-        AND (expected_sha256 IS NULL OR expected_sha256 = ?)
+        AND expected_sha256 = ?
       LIMIT 1
     `).get(sessionId, sha256);
     if (!referenced && !anotherUpload) {
