@@ -11,7 +11,13 @@ import { contentDisposition, safeDisplayFilename } from './content-disposition';
 import { dateAfterSeconds, nowIso, type SqliteDatabase } from './db';
 import { HttpError, UploadValidationError } from './errors';
 import { installContentAddressedFile, objectFileStat, receiveUpload, removeTempFile, resolveStoragePath, tempPath } from './file-store';
-import { runGarbageCollection, scanIntegrity } from './maintenance';
+import {
+  listAdminBindingInventory,
+  listAdminObjectInventory,
+  runGarbageCollection,
+  scanIntegrity,
+  type GcOptions,
+} from './maintenance';
 import { requestId, requestIp } from './request-identity';
 import { adminAuth, safeEqualHash, serviceAuth, tokenHash, asyncRoute, bearerToken } from './security';
 
@@ -64,6 +70,51 @@ function routeParam(req: Request, name: string): string {
   const value = req.params[name];
   if (typeof value !== 'string') fail(400, 'invalid_path', `${name} is invalid`);
   return value;
+}
+
+function boundedQueryLimit(req: Request, fallback = 50): number {
+  const raw = req.query.limit;
+  if (raw === undefined) return fallback;
+  if (typeof raw !== 'string' || !/^[1-9]\d{0,2}$/.test(raw)) fail(400, 'invalid_limit', 'limit must be an integer between 1 and 100');
+  const value = Number(raw);
+  if (value > 100) fail(400, 'invalid_limit', 'limit must be an integer between 1 and 100');
+  return value;
+}
+
+function optionalCursor(req: Request, field = 'after'): string | undefined {
+  const raw = req.query[field];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || raw.length < 1 || raw.length > 128 || /[\u0000-\u001f\u007f]/.test(raw)) {
+    fail(400, 'invalid_cursor', `${field} cursor is invalid`);
+  }
+  return raw;
+}
+
+interface GcRunCursor {
+  created_at: string;
+  id: string;
+}
+
+function decodeGcRunCursor(raw: string | undefined): GcRunCursor | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    const decoded = Buffer.from(raw, 'base64url').toString('utf8');
+    const cursor = JSON.parse(decoded) as Partial<GcRunCursor>;
+    if (
+      typeof cursor.created_at !== 'string' || Number.isNaN(Date.parse(cursor.created_at)) ||
+      typeof cursor.id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cursor.id) ||
+      Buffer.from(decoded).toString('base64url') !== raw
+    ) {
+      fail(400, 'invalid_cursor', 'after cursor is invalid');
+    }
+    return { created_at: cursor.created_at, id: cursor.id };
+  } catch {
+    fail(400, 'invalid_cursor', 'after cursor is invalid');
+  }
+}
+
+function encodeGcRunCursor(cursor: GcRunCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
 }
 
 function requestBody(req: Request): Record<string, unknown> {
@@ -576,9 +627,90 @@ export function createApp(config: AppConfig, db: SqliteDatabase): Express {
     setContext(req, 'admin_gc');
     const body = req.body === undefined ? {} : requestBody(req);
     if (body.dry_run !== undefined && typeof body.dry_run !== 'boolean') fail(400, 'invalid_request', 'dry_run must be a boolean');
-    const result = await runGarbageCollection(db, config, body.dry_run === true);
+    if (body.confirm !== undefined && typeof body.confirm !== 'boolean') fail(400, 'invalid_request', 'confirm must be a boolean');
+    const limit = body.limit === undefined ? 50 : body.limit;
+    if (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 100) fail(400, 'invalid_limit', 'limit must be an integer between 1 and 100');
+    if (!Array.isArray(body.object_ids) || body.object_ids.length < 1 || body.object_ids.length > 100 || body.object_ids.some((id) => typeof id !== 'string' || id.length < 16 || id.length > 80 || !/^[A-Za-z0-9_-]+$/.test(id))) {
+      fail(400, 'invalid_object_ids', 'object_ids must contain between 1 and 100 valid object IDs');
+    }
+    if (new Set(body.object_ids as string[]).size !== body.object_ids.length) fail(400, 'invalid_object_ids', 'object_ids must be unique');
+    const options: GcOptions = {
+      dryRun: body.dry_run !== false,
+      limit: limit as number,
+      objectIds: body.object_ids as string[],
+      confirm: body.confirm === true,
+    };
+    if (!options.dryRun && !options.confirm) fail(400, 'confirmation_required', 'confirm must be true before GC deletes filtered candidates');
+    const result = await runGarbageCollection(db, config, options);
     return res.json(result);
   }));
+
+  app.get('/api/admin/gc/runs', adminAuth(config), (req, res) => {
+    setContext(req, 'admin_gc_audit_list');
+    const limit = boundedQueryLimit(req);
+    const after = decodeGcRunCursor(optionalCursor(req));
+    const rows = db.prepare(`
+      SELECT id, created_at, completed_at, status, dry_run, requested_limit, requested_object_ids,
+        candidates, bytes_reclaimable, deleted, skipped, failed
+      FROM admin_gc_runs
+      WHERE (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
+      ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(after?.created_at ?? null, after?.created_at ?? null, after?.created_at ?? null, after?.id ?? null, limit + 1) as Array<Record<string, unknown> & { id: string; created_at: string }>;
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map((row) => ({
+      ...row,
+      dry_run: row.dry_run === 1,
+      requested_object_ids: JSON.parse(String(row.requested_object_ids)) as string[],
+    }));
+    const last = items.at(-1);
+    return res.json({ items, next_cursor: hasMore && last ? encodeGcRunCursor({ created_at: last.created_at, id: last.id }) : null });
+  });
+
+  app.get('/api/admin/gc/runs/:runId', adminAuth(config), (req, res) => {
+    setContext(req, 'admin_gc_audit_detail');
+    const runId = routeParam(req, 'runId');
+    const run = db.prepare(`
+      SELECT id, created_at, completed_at, status, dry_run, requested_limit, requested_object_ids,
+        candidates, bytes_reclaimable, deleted, skipped, failed
+      FROM admin_gc_runs WHERE id = ?
+    `).get(runId) as (Record<string, unknown> & { id: string; requested_object_ids: string; dry_run: number }) | undefined;
+    if (!run) return sendError(res, 404, 'gc_run_not_found', 'GC run was not found', req.requestId);
+    const items = db.prepare(`
+      SELECT object_id, object_public_id, sha256, size_bytes, outcome, created_at
+      FROM admin_gc_run_items WHERE run_id = ? ORDER BY created_at ASC, object_id ASC
+    `).all(runId);
+    return res.json({ run: { ...run, dry_run: run.dry_run === 1, requested_object_ids: JSON.parse(run.requested_object_ids) as string[] }, items });
+  });
+
+  app.get('/api/admin/inventory/objects', adminAuth(config), (req, res) => {
+    setContext(req, 'admin_object_inventory');
+    const stateRaw = req.query.state;
+    const states = ['verified', 'missing', 'corrupt', 'quarantined'] as const;
+    if (stateRaw !== undefined && (typeof stateRaw !== 'string' || !states.includes(stateRaw as (typeof states)[number]))) {
+      fail(400, 'invalid_state', 'state must be verified, missing, corrupt, or quarantined');
+    }
+    const after = optionalCursor(req);
+    return res.json(listAdminObjectInventory(db, {
+      limit: boundedQueryLimit(req),
+      ...(after ? { after } : {}),
+      ...(typeof stateRaw === 'string' ? { state: stateRaw as (typeof states)[number] } : {}),
+    }));
+  });
+
+  app.get('/api/admin/inventory/bindings', adminAuth(config), (req, res) => {
+    setContext(req, 'admin_binding_inventory');
+    const namespace = req.query.namespace;
+    const ownerType = req.query.owner_type;
+    if (typeof namespace !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/.test(namespace)) fail(400, 'invalid_namespace', 'namespace is required and must be valid');
+    if (typeof ownerType !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/.test(ownerType)) fail(400, 'invalid_owner_type', 'owner_type is required and must be valid');
+    const after = optionalCursor(req);
+    return res.json(listAdminBindingInventory(db, {
+      namespace,
+      ownerType,
+      limit: boundedQueryLimit(req),
+      ...(after ? { after } : {}),
+    }));
+  });
 
   app.post('/api/admin/integrity/scan', adminAuth(config), asyncRoute(async (req, res) => {
     setContext(req, 'admin_integrity_scan');

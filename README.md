@@ -85,7 +85,11 @@ All JSON errors use `{ "error": { "code": "...", "message": "..." }, "request_id
 | `POST /api/v1/objects/:id/signed-url` | Service API Key | Issue a short-lived private download URL |
 | `GET /private/:token` | Short-lived URL token | Private, no-store download with Range support |
 | `GET` or `HEAD /o/:publicId/:filename` | Public binding | Public download cached for 24 hours, with Range, ETag, and UTF-8 filename support |
-| `POST /api/admin/gc` | Service or admin key | Run GC; `{ "dry_run": true }` reports candidates without deleting |
+| `POST /api/admin/gc` | Service or admin key | Bounded GC for explicitly selected object IDs; dry-run is the default and deletion requires `confirm: true` |
+| `GET /api/admin/gc/runs` | Service or admin key | Page through GC batch audit summaries |
+| `GET /api/admin/gc/runs/:runId` | Service or admin key | Read the bounded per-object outcome audit for one GC batch |
+| `GET /api/admin/inventory/objects` | Service or admin key | Page through object metadata, optionally filtered by state |
+| `GET /api/admin/inventory/bindings` | Service or admin key | Page through bindings for a required namespace and owner type |
 | `POST /api/admin/integrity/scan` | Service or admin key | Check all non-quarantined objects and mark missing/corrupt rows |
 
 ### Create and upload
@@ -189,13 +193,15 @@ EdgeOne may identify the preceding proxy in `EO-Connecting-IP` when another prox
 
 ## Maintenance
 
+GC is restricted to at most 100 explicitly selected objects per batch. Every run, including dry-runs, is stored with its requested IDs and per-object outcome. A dry-run can be inspected with the returned `run_id` before an operator makes a separate confirmed request. Candidate eligibility is recalculated under an immediate SQLite write lock before each deletion; age, bindings, active uploads, private links, and quarantine status are checked again.
+
 ```bash
-npm run gc -- --dry-run
-npm run gc
+npm run gc -- --dry-run --object-id <object-public-id>
+npm run gc -- --object-id <object-public-id> --confirm
 npm run integrity
 ```
 
-Dry-run output includes `candidates`, `bytes_reclaimable`, `deleted`, and `failed`. `npm run gc` without `--dry-run` deletes eligible objects. Integrity output includes `checked`, `healthy`, `missing`, `corrupt`, and `failed`.
+The admin API accepts `POST /api/admin/gc` with `{ "object_ids": ["<object-public-id>"], "limit": 50 }`. It defaults to a dry-run. Deletion requires `{ "dry_run": false, "confirm": true, "object_ids": ["<object-public-id>"], "limit": 50 }`. The response returns a `run_id`; inspect `/api/admin/gc/runs/:runId` for per-object results. Admin inventory is bounded to 100 rows per page and binding enumeration requires both `namespace` and `owner_type`; for Forum reconciliation, use `namespace=mindforum&owner_type=resource_file`. Inventory exposes object hashes, sizes, state, filenames, and binding metadata, but never filesystem paths or credentials. Integrity output includes `checked`, `healthy`, `missing`, `corrupt`, and `failed`.
 
 ## Deployment
 
